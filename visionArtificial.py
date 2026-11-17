@@ -3,6 +3,8 @@ import json
 import time
 import base64
 import asyncio
+import tempfile
+import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -35,6 +37,16 @@ MIN_AREA_PIXELES = 3000.0
 # Configuración de marcador ArUco por defecto
 ARUCO_DICCIONARIO_DEFAULT = cv2.aruco.DICT_4X4_50
 DEFAULT_MARKER_SIZE_CM = 10.0
+# Alineado con porcitech-backend/app/vision/pipeline.py: se prueban en orden.
+# DICT_4X4_100 incluye los IDs 0..49 de DICT_4X4_50.
+ARUCO_DICTIONARIES = [
+    ("DICT_4X4_100", cv2.aruco.DICT_4X4_100),
+    ("DICT_4X4_50", cv2.aruco.DICT_4X4_50),
+    ("DICT_5X5_100", cv2.aruco.DICT_5X5_100),
+]
+PESO_MAXIMO_FISIOLOGICO_KG = 500.0
+_YOLO_INFER_LOCK = threading.Lock()
+_CALIBRATION_LOCK = threading.Lock()
 
 
 # ============================================================================
@@ -62,6 +74,8 @@ class DeteccionIndividualSchema(BaseModel):
     ratio_aspecto: float
     momentos_hu: List[float] = Field(default_factory=list, description="7 Momentos invariantes de Hu en escala logarítmica")
     vector_caracteristicas_xgboost: List[float] = Field(default_factory=list, description="Vector listo para inferencia/entrenamiento con XGBoost")
+    algoritmo_peso: str = Field("alomorfico_huxley", description="Algoritmo usado para esta detección: xgboost o alomorfico_huxley")
+    peso_huxley_referencia_kg: Optional[float] = Field(None, description="Peso Huxley de referencia para comparar con XGBoost")
     bbox: BoundingBoxSchema
     bounding_box: Dict[str, int]
 
@@ -116,6 +130,10 @@ class CapturaRTSPRequest(BaseModel):
         None, gt=1.0, le=100.0, description="Override manual opcional de calibración"
     )
     conf_threshold: float = Field(0.45, ge=0.1, le=0.99)
+    tamano_marcador_cm: Optional[float] = Field(
+        None, gt=1.0, le=100.0,
+        description="Lado real del marcador si aparece en la escena (por defecto: el de la calibración guardada o 10 cm)"
+    )
     validar_bordes: bool = Field(
         False, description="Si es True, rechaza capturas donde el cerdo toque el borde de la imagen"
     )
@@ -130,7 +148,9 @@ class CapturaRTSPRequest(BaseModel):
 class CalibrarRTSPRequest(BaseModel):
     rtsp_url: str = Field(..., description="URL RTSP de la cámara apuntando al corral con el marcador en el suelo")
     tamano_marcador_cm: float = Field(10.0, gt=1.0, le=100.0, description="Tamaño real del lado del marcador en cm")
-    diccionario_aruco: int = Field(ARUCO_DICCIONARIO_DEFAULT, description="ID del diccionario ArUco de OpenCV")
+    diccionario_aruco: Optional[int] = Field(
+        None, description="ID del diccionario ArUco de OpenCV (None = probar DICT_4X4_100, DICT_4X4_50 y DICT_5X5_100)"
+    )
 
 
 # ============================================================================
@@ -163,9 +183,78 @@ def guardar_calibracion_persistente(
         "fecha_calibracion": datetime.now(timezone.utc).isoformat(),
         "estado": "calibrado"
     }
-    with open(ARCHIVO_CALIBRACION, "w", encoding="utf-8") as f:
-        json.dump(datos, f, indent=2, ensure_ascii=False)
+    # Escritura atómica: un lector concurrente nunca ve un JSON a medio escribir.
+    destino = ARCHIVO_CALIBRACION.resolve()
+    with _CALIBRATION_LOCK:
+        fd, tmp_path = tempfile.mkstemp(prefix=".calibracion_", suffix=".json", dir=str(destino.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(datos, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, destino)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
     return datos
+
+
+def tamano_marcador_por_defecto() -> float:
+    """Lado del marcador: el usado en la última calibración guardada o 10 cm."""
+    calib = cargar_calibracion_persistente()
+    try:
+        valor = float((calib or {}).get("tamano_marcador_cm") or DEFAULT_MARKER_SIZE_CM)
+        return valor if valor > 0 else DEFAULT_MARKER_SIZE_CM
+    except (TypeError, ValueError):
+        return DEFAULT_MARKER_SIZE_CM
+
+
+def resolve_pig_class_ids(model: Any) -> Optional[List[int]]:
+    """IDs de clase porcina del modelo YOLO (None si el modelo no tiene esa clase)."""
+    names = getattr(model, "names", None)
+    items = names.items() if isinstance(names, dict) else enumerate(names or [])
+    matched = [
+        int(k) for k, v in items
+        if any(t in str(v).lower() for t in ("pig", "cerdo", "porcin"))
+    ]
+    return matched or None
+
+
+def predict_yolo_safe(model: Any, source: np.ndarray, conf: float = 0.45) -> Any:
+    """model.predict protegido por lock de hilos y filtrado a la clase porcina."""
+    kwargs: Dict[str, Any] = {"source": source, "conf": conf, "verbose": False}
+    pig_classes = resolve_pig_class_ids(model)
+    if pig_classes is not None:
+        kwargs["classes"] = pig_classes
+    with _YOLO_INFER_LOCK:
+        return model.predict(**kwargs)
+
+
+def estimar_peso_hibrido(
+    xgb_model: Optional[Any],
+    vector_xgboost: List[float],
+    area_cm2: float,
+) -> Dict[str, Any]:
+    """XGBoost con validación de rango fisiológico [1, 500] kg y fallback a Huxley."""
+    peso_huxley = round(COEF_ALOMETRICO_A * (area_cm2 ** EXPONENTE_ALOMETRICO_B), 2)
+    if xgb_model is not None:
+        try:
+            import xgboost as xgb
+            dmatrix = xgb.DMatrix(np.array([vector_xgboost], dtype=np.float32))
+            peso_predicho = float(xgb_model.predict(dmatrix)[0])
+            if 1.0 <= peso_predicho <= PESO_MAXIMO_FISIOLOGICO_KG:
+                return {
+                    "peso_estimado_kg": round(peso_predicho, 2),
+                    "algoritmo_peso": "xgboost",
+                    "peso_huxley_referencia_kg": peso_huxley,
+                }
+            print(f"[PorciTech Vision] XGBoost fuera de rango ({peso_predicho:.2f} kg); usando Huxley.")
+        except Exception as e:
+            print(f"[PorciTech Vision] Error en XGBoost predict ({e}), usando fallback Huxley.")
+    return {
+        "peso_estimado_kg": peso_huxley,
+        "algoritmo_peso": "alomorfico_huxley",
+        "peso_huxley_referencia_kg": peso_huxley,
+    }
 
 
 # ============================================================================
@@ -174,36 +263,43 @@ def guardar_calibracion_persistente(
 def detectar_marcador_aruco(
     frame: np.ndarray,
     tamano_marcador_cm: float = DEFAULT_MARKER_SIZE_CM,
-    diccionario_id: int = ARUCO_DICCIONARIO_DEFAULT
+    diccionario_id: Optional[int] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Detecta el marcador fiducial ArUco en el frame y calcula la escala exacta píxeles/cm.
-    Dibuja el contorno cian del marcador sobre el frame.
+    Si no se indica diccionario, prueba DICT_4X4_100, DICT_4X4_50 y DICT_5X5_100
+    (mismo orden que el backend). Dibuja el contorno cian del marcador sobre el frame.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    aruco_dict = cv2.aruco.getPredefinedDictionary(diccionario_id)
-    detector_params = cv2.aruco.DetectorParameters()
-    detector = cv2.aruco.ArucoDetector(aruco_dict, detector_params)
+    if frame is None or frame.size == 0 or tamano_marcador_cm <= 0:
+        return None
 
-    esquinas, ids, _ = detector.detectMarkers(gray)
-    if ids is not None and len(esquinas) > 0:
-        # Tomar el primer marcador detectado
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    detector_params = cv2.aruco.DetectorParameters()
+    candidatos = [("CUSTOM", diccionario_id)] if diccionario_id is not None else ARUCO_DICTIONARIES
+
+    for nombre_dict, dict_const in candidatos:
+        try:
+            aruco_dict = cv2.aruco.getPredefinedDictionary(dict_const)
+            detector = cv2.aruco.ArucoDetector(aruco_dict, detector_params)
+            esquinas, ids, _ = detector.detectMarkers(gray)
+        except Exception:
+            continue
+
+        if ids is None or len(esquinas) == 0:
+            continue
+
         pts = esquinas[0][0]  # Array de 4 puntos (x, y)
         marker_id = int(ids.flatten()[0])
+        lado_px_promedio = sum(
+            float(np.linalg.norm(pts[i] - pts[(i + 1) % 4])) for i in range(4)
+        ) / 4.0
 
-        lado_px_1 = float(np.linalg.norm(pts[0] - pts[1]))
-        lado_px_2 = float(np.linalg.norm(pts[1] - pts[2]))
-        lado_px_3 = float(np.linalg.norm(pts[2] - pts[3]))
-        lado_px_4 = float(np.linalg.norm(pts[3] - pts[0]))
-        lado_px_promedio = (lado_px_1 + lado_px_2 + lado_px_3 + lado_px_4) / 4.0
-
-        if lado_px_promedio > 10.0 and tamano_marcador_cm > 0:
+        if lado_px_promedio > 10.0:
             ppc_medido = float(lado_px_promedio / tamano_marcador_cm)
-            alto, ancho = frame.shape[:2]
+            _, ancho = frame.shape[:2]
             # Normalizar a base 1280px para independencia de resolución
             ppc_base1280 = ppc_medido / (ancho / float(DEFAULT_REF_WIDTH))
 
-            # Dibujar anotación visual del marcador ArUco en color cian (255, 255, 0 en BGR)
             cv2.aruco.drawDetectedMarkers(frame, esquinas, ids, borderColor=(255, 255, 0))
             cv2.putText(
                 frame,
@@ -219,6 +315,7 @@ def detectar_marcador_aruco(
                 "pixels_per_cm_medido": ppc_medido,
                 "pixels_per_cm_base1280": ppc_base1280,
                 "marcador_id": marker_id,
+                "diccionario": nombre_dict,
                 "lado_px_promedio": lado_px_promedio,
                 "esquinas": pts.tolist()
             }
@@ -386,9 +483,12 @@ def procesar_frame_morfometria_sync(
     frame: np.ndarray,
     pixels_per_cm_override: Optional[float] = None,
     conf_threshold: float = 0.45,
-    validar_bordes: bool = False
+    validar_bordes: bool = False,
+    tamano_marcador_cm: Optional[float] = None
 ) -> Dict[str, Any]:
     alto_orig, ancho_orig = frame.shape[:2]
+    if not tamano_marcador_cm or tamano_marcador_cm <= 0:
+        tamano_marcador_cm = tamano_marcador_por_defecto()
     img_anotada = frame.copy()
 
     # 1. Determinación de la escala métrica (Prioridades: 1. ArUco en vivo, 2. Override manual, 3. Calibración guardada, 4. Fábrica)
@@ -396,7 +496,7 @@ def procesar_frame_morfometria_sync(
     base_ppc = DEFAULT_PIXELS_PER_CM_AT_1280
 
     # Intento de detección ArUco en el fotograma actual
-    resultado_aruco = detectar_marcador_aruco(img_anotada)
+    resultado_aruco = detectar_marcador_aruco(img_anotada, tamano_marcador_cm)
     if resultado_aruco is not None:
         base_ppc = resultado_aruco["pixels_per_cm_base1280"]
         metodo_calibracion = "aruco_en_vivo"
@@ -412,9 +512,11 @@ def procesar_frame_morfometria_sync(
 
     factor_resolucion = ancho_orig / float(DEFAULT_REF_WIDTH)
     pixels_per_cm_efectivo = base_ppc * factor_resolucion
+    if pixels_per_cm_efectivo <= 0:
+        raise ValueError("El factor de calibración pixels_per_cm debe ser mayor a 0.")
 
-    # 2. Inferencia con YOLO
-    resultados = model.predict(source=frame, conf=conf_threshold, verbose=False)
+    # 2. Inferencia con YOLO (thread-safe y filtrada a la clase porcina)
+    resultados = predict_yolo_safe(model, frame, conf=conf_threshold)
     if not resultados or len(resultados[0].boxes) == 0:
         raise ValueError("No se detectó ningún ejemplar porcino en la imagen.")
 
@@ -422,6 +524,7 @@ def procesar_frame_morfometria_sync(
     boxes = res.boxes
     tiene_mascaras = res.masks is not None and len(res.masks.xy) > 0
     detecciones: List[DeteccionIndividualSchema] = []
+    descartados_borde = 0
 
     for idx in range(len(boxes)):
         conf = float(boxes.conf[idx].cpu().numpy())
@@ -435,9 +538,11 @@ def procesar_frame_morfometria_sync(
                 or x2 >= (ancho_orig - margen_px)
                 or y2 >= (alto_orig - margen_px)
             ):
+                descartados_borde += 1
                 continue
 
         # 3. Geometría y contornos
+        usa_mascara = False
         if tiene_mascaras and idx < len(res.masks.xy) and len(res.masks.xy[idx]) >= 3:
             contorno = np.array(res.masks.xy[idx], dtype=np.int32)
             area_pixeles = float(cv2.contourArea(contorno))
@@ -452,6 +557,7 @@ def procesar_frame_morfometria_sync(
             # Cálculo de Ancho Torácico y Momentos de Hu
             ancho_torax_px = calcular_ancho_toracico_px(contorno, largo_px, ancho_px)
             momentos_hu = calcular_momentos_hu(contorno)
+            usa_mascara = True
 
             cv2.polylines(img_anotada, [contorno], isClosed=True, color=(16, 185, 129), thickness=3)
         else:
@@ -478,20 +584,11 @@ def procesar_frame_morfometria_sync(
         # Vector listo para XGBoost
         vector_xgboost = [area_cm2, largo_cm, ancho_cm, ancho_toracico_cm, ratio_aspecto] + momentos_hu
 
-        # 5. Inferencia de Peso (XGBoost o Ecuación Alométrica de Huxley)
-        algoritmo_peso = "alomorfico_huxley"
-        if xgb_model is not None:
-            try:
-                import xgboost as xgb
-                dmatrix = xgb.DMatrix(np.array([vector_xgboost], dtype=np.float32))
-                peso_predicho = float(xgb_model.predict(dmatrix)[0])
-                peso_estimado_kg = round(peso_predicho, 2)
-                algoritmo_peso = "xgboost"
-            except Exception as e:
-                print(f"[PorciTech Vision] Error en XGBoost predict ({e}), usando fallback Huxley.")
-                peso_estimado_kg = round(COEF_ALOMETRICO_A * (area_cm2 ** EXPONENTE_ALOMETRICO_B), 2)
-        else:
-            peso_estimado_kg = round(COEF_ALOMETRICO_A * (area_cm2 ** EXPONENTE_ALOMETRICO_B), 2)
+        # 5. Inferencia de Peso: XGBoost solo con máscara real (sin máscara Hu=[0]*7 queda
+        #    fuera de distribución) y dentro de rango fisiológico; si no, Huxley.
+        est = estimar_peso_hibrido(xgb_model if usa_mascara else None, vector_xgboost, area_cm2)
+        peso_estimado_kg = est["peso_estimado_kg"]
+        algoritmo_peso = est["algoritmo_peso"]
 
         bbox_obj = BoundingBoxSchema(
             x1=round(x1, 1),
@@ -516,6 +613,8 @@ def procesar_frame_morfometria_sync(
                 ratio_aspecto=ratio_aspecto,
                 momentos_hu=momentos_hu,
                 vector_caracteristicas_xgboost=vector_xgboost,
+                algoritmo_peso=algoritmo_peso,
+                peso_huxley_referencia_kg=est["peso_huxley_referencia_kg"],
                 bbox=bbox_obj,
                 bounding_box={"x": x_rect, "y": y_rect, "ancho": w_rect, "alto": h_rect}
             )
@@ -535,6 +634,8 @@ def procesar_frame_morfometria_sync(
         )
 
     if not detecciones:
+        if descartados_borde > 0:
+            raise ValueError("El porcino toca el borde del encuadre cenital. Capture cuando esté centrado.")
         raise ValueError("No se detectó ningún ejemplar porcino válido.")
 
     detecciones.sort(key=lambda d: d.confianza, reverse=True)
@@ -547,7 +648,7 @@ def procesar_frame_morfometria_sync(
         "fecha_registro": datetime.now(timezone.utc),
         "total_detectados": len(detecciones),
         "metodo_calibracion": metodo_calibracion,
-        "algoritmo_peso": algoritmo_peso,
+        "algoritmo_peso": principal.algoritmo_peso,
         "pixels_per_cm_utilizado": round(pixels_per_cm_efectivo, 3),
         "peso_estimado_kg": principal.peso_estimado_kg,
         "confianza": principal.confianza,
@@ -645,7 +746,7 @@ async def evaluar_concepto_veterinario_gemini_async(
 async def calibrar_con_foto(
     file: UploadFile = File(...),
     tamano_marcador_cm: float = Form(DEFAULT_MARKER_SIZE_CM),
-    diccionario_id: int = Form(ARUCO_DICCIONARIO_DEFAULT)
+    diccionario_id: Optional[int] = Form(None)
 ):
     """
     Recibe una fotografía del corral VACÍO con el marcador ArUco colocado en el suelo.
@@ -774,6 +875,7 @@ async def estimar_peso(
     pixels_per_cm: Optional[float] = Form(None),
     conf_threshold: float = Form(0.45),
     validar_bordes: bool = Form(False),
+    tamano_marcador_cm: Optional[float] = Form(None, description="Lado real del marcador si aparece en la foto"),
     evaluar_veterinaria: bool = Form(False, description="Activa el diagnóstico clínico multimodal con Gemini"),
     gemini_api_key: Optional[str] = Form(None, description="API Key opcional de Google Gemini")
 ):
@@ -803,7 +905,8 @@ async def estimar_peso(
                     frame=frame,
                     pixels_per_cm_override=pixels_per_cm,
                     conf_threshold=conf_threshold,
-                    validar_bordes=validar_bordes
+                    validar_bordes=validar_bordes,
+                    tamano_marcador_cm=tamano_marcador_cm
                 )
         else:
             resultado = await asyncio.to_thread(
@@ -813,7 +916,8 @@ async def estimar_peso(
                 frame=frame,
                 pixels_per_cm_override=pixels_per_cm,
                 conf_threshold=conf_threshold,
-                validar_bordes=validar_bordes
+                validar_bordes=validar_bordes,
+                tamano_marcador_cm=tamano_marcador_cm
             )
 
         if evaluar_veterinaria:
@@ -868,7 +972,8 @@ async def estimar_peso_desde_camara_rtsp(
                     frame=frame,
                     pixels_per_cm_override=payload.pixels_per_cm,
                     conf_threshold=payload.conf_threshold,
-                    validar_bordes=payload.validar_bordes
+                    validar_bordes=payload.validar_bordes,
+                    tamano_marcador_cm=payload.tamano_marcador_cm
                 )
         else:
             resultado = await asyncio.to_thread(
@@ -878,7 +983,8 @@ async def estimar_peso_desde_camara_rtsp(
                 frame=frame,
                 pixels_per_cm_override=payload.pixels_per_cm,
                 conf_threshold=payload.conf_threshold,
-                validar_bordes=payload.validar_bordes
+                validar_bordes=payload.validar_bordes,
+                tamano_marcador_cm=payload.tamano_marcador_cm
             )
 
         if payload.evaluar_veterinaria:
